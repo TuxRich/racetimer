@@ -36,6 +36,7 @@ static unsigned nch;
 static char events[EVENTS][EVENT_BYTES];
 static unsigned ev_head, ev_n;
 static int64_t status_at_us;
+static bool cal_finished; /* a calibration's last pair came in: save its offset */
 
 uint32_t gate_now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -170,7 +171,9 @@ void gate_levels(unsigned board, const frame_levels_t *h, const frame_level_t *l
             snprintf(json, sizeof(json), "{\"t\":\"seat\",\"ms\":%" PRIu32 ",\"b\":%u,\"ch\":%u,\"pk\":%u}", t, board,
                      ch, seat->pass_peak);
             event_push(json);
+            bool cal = fusion_calibrating(&fusion);
             fusion_pass(&fusion, board, ch, t, seat->pass_peak, (uint32_t)(rx_us / 1000));
+            if (cal && !fusion_calibrating(&fusion)) cal_finished = true;
             drain_fusion();
         }
     }
@@ -215,12 +218,13 @@ void gate_clear(void) {
 size_t gate_json_levels(char *buf, size_t cap) {
     xSemaphoreTake(lock, portMAX_DELAY);
     /* Singles wait for their pair; report them once the wait is over. Save
-     * a calibration's result when it completes. */
-    bool was_cal = fusion_calibrating(&fusion);
+     * a calibration's result once it has completed (in gate_levels: only a
+     * pair completes one). */
     fusion_poll(&fusion, gate_now_ms());
     drain_fusion();
     int16_t cal_offset = fusion.cfg.offset;
-    bool cal_done = was_cal && !fusion_calibrating(&fusion);
+    bool cal_done = cal_finished;
+    cal_finished = false;
     size_t n = (size_t)snprintf(buf, cap, "{\"t\":\"lv\",\"ms\":%" PRIu32 ",\"l\":[", gate_now_ms());
     for (unsigned b = 0; b < C5_BOARDS && n < cap; b++) {
         n += (size_t)snprintf(buf + n, cap - n, "%s[", b ? "," : "");
