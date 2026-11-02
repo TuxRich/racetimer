@@ -143,3 +143,10 @@ between gates, RotorHazard plugin.
   tests pass (`pio test -e native`, 14 cases). The web UI was checked against
   `tools/gate_sim.py` in headless Chromium (light, dark, 390 px phone width).
 - Next: bench test with real boards (Verification), then Milestone 4.
+- 2026-11-02: `gate-teensy/`, the controller on a Teensy 4.1 with Ethernet
+  (docs/teensy.md): `gate/src`'s logic compiled as it is, serial ports,
+  QNEthernet, its own HTTP/WebSocket server. Builds for the Teensy; host
+  tests pass (16); ran on a PC against two simulated C5s and a browser. Not
+  yet on hardware. Found there: a finished calibration's offset was never
+  saved or shown, and the next settings change undid it (`gate.c`, fixed for
+  both controllers).

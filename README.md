@@ -44,6 +44,10 @@ Per gate:
   receivers, runs Widscan58's own pass detection (`lap.c`) per receiver and
   channel, pairs the top and bottom passes, decides the verdict, and serves a
   live web UI from its own Wi-Fi access point.
+- **Or a Teensy 4.1 with Ethernet** (`gate-teensy/`): the same gate logic
+  and web UI, compiled from `gate/src`, on a wired network instead of the
+  gate's own Wi-Fi. Not yet run on hardware: see
+  [docs/teensy.md](docs/teensy.md).
 
 ## Quick start
 
@@ -58,6 +62,10 @@ pio run -e esp32c5_uart -t upload
 # Gate controller. ESP32-WROOM dev board on USB:
 cd ../../../gate
 pio run -e esp32dev -t upload
+
+# Or a Teensy 4.1 controller (Ethernet; docs/teensy.md):
+cd ../gate-teensy
+pio run -t upload
 ```
 
 A printable case for the XIAO ESP32-C5 and its antenna is in
@@ -91,6 +99,7 @@ console to the receivers, and **Record**, which saves the session as CSV for
 
 ```sh
 cd gate && pio test -e native       # pairing, verdicts, laps, calibration
+cd ../gate-teensy && pio test -e native   # receiver frame parser, WebSocket
 ```
 
 ## Credits

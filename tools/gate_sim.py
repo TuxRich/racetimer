@@ -6,6 +6,7 @@
 """A pretend gate controller for working on the web UI without hardware.
 
     uv run tools/gate_sim.py          # then open http://localhost:8058/
+    uv run tools/gate_sim.py --eth    # as the Teensy 4.1 controller (Ethernet)
 
 Serves gate/web/index.html and a /ws WebSocket that speaks the gate's
 messages (src/web.h): levels at ~30 per second, and on each channel a pass
@@ -13,6 +14,7 @@ every 6-10 s that goes through the middle, near a bar, over, under, or past
 one bar only. Verdicts follow gate_fusion.c's rules. Commands from the page
 change the simulated settings. GPL-3.0-or-later.
 """
+import argparse
 import asyncio
 import json
 import math
@@ -28,6 +30,10 @@ PAGE = pathlib.Path(__file__).resolve().parent.parent / "gate" / "web" / "index.
 cfg = {"t": "cfg", "names": ["R1", "R3", "R6", "R8"], "channels": "R1=5658 R3=5732 R6=5843 R8=5917",
        "gain": 45, "enter": 125, "exit": 105, "delta": 24, "offset": 0, "pair": 75, "wait": 1000,
        "minlap": 5000, "ssid": ""}
+# --eth: the Teensy controller's network message (gate-teensy/src/net.cpp)
+net = {"t": "net", "if": "eth", "st": "up", "ip": "127.0.0.1", "name": "racegate-51A0", "dhcp": 1, "mbps": 100,
+       "sip": "", "sgw": ""}
+eth = False
 BOARD_BIAS = 6  # the top board reads 1.5 dB hotter: what calibration removes
 clients = set()
 cal = {"left": 0, "sum": 0, "n": 0}
@@ -126,13 +132,18 @@ async def simulate():
             status_at = t
             board = {"ok": 1, "fps": 2010, "crc": 0, "bad": 0, "setups": 1, "drops": 0, "fill": 3, "sat": 0, "run": 1}
             await broadcast({"t": "st", "up": t // 1000, "cal": int(cal["left"] > 0), "b": [board, dict(board)]})
+            if eth:
+                await broadcast(net)
 
 
 async def command(ws, text):
     parts = text.split(" ", 2)
     if parts[0] == "set" and len(parts) == 3:
         key, val = parts[1], parts[2]
-        if key in ("channels", "ssid"):
+        if eth and key in ("ip", "gw"):
+            net["sip" if key == "ip" else "sgw"] = val.strip()
+            await broadcast(net)
+        elif key in ("channels", "ssid"):
             cfg[key] = val
             if key == "channels":
                 cfg["names"] = [c.split("=")[0] for c in val.split()]
@@ -154,6 +165,8 @@ async def command(ws, text):
 async def handler(ws):
     clients.add(ws)
     await ws.send(json.dumps(cfg))
+    if eth:
+        await ws.send(json.dumps(net))
     try:
         async for msg in ws:
             await command(ws, msg)
@@ -177,4 +190,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="A pretend gate controller for the web UI.")
+    ap.add_argument("--eth", action="store_true", help="as the Teensy 4.1 controller: Ethernet, not Wi-Fi")
+    eth = ap.parse_args().eth
     asyncio.run(main())

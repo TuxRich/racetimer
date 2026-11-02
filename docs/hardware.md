@@ -2,7 +2,8 @@
 
 Per gate: two Seeed XIAO ESP32-C5 receivers, one ESP32-WROOM dev board, a
 5 V supply, and antennas for the receivers. Full parts list:
-[parts.md](parts.md).
+[parts.md](parts.md). For a Teensy 4.1 controller on Ethernet instead of
+the WROOM, see [teensy.md](teensy.md).
 
 ## Wiring
 

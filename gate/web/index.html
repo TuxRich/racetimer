@@ -20,8 +20,11 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); }
+footer { padding: 0 16px 16px; text-align: center; font-size: 12px; }
 header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
   padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
 header h1 { font-size: 17px; margin: 0; }
@@ -101,8 +104,10 @@ details summary { cursor: pointer; font-weight: 600; }
       </div>
       <div class="row" style="margin-top:8px">
         <label>Channels<input class="wide" data-key="channels" data-text></label>
-        <label>Wi-Fi network (blank: access point only)<input data-key="ssid" data-text></label>
-        <label>Wi-Fi password<input type="password" data-key="pass" data-text></label>
+        <label data-net="wifi">Wi-Fi network (blank: access point only)<input data-key="ssid" data-text></label>
+        <label data-net="wifi">Wi-Fi password<input type="password" data-key="pass" data-text></label>
+        <label data-net="eth" hidden>IP address (blank: DHCP)<input data-key="ip" data-text placeholder="DHCP"></label>
+        <label data-net="eth" hidden>Gateway (blank: none)<input data-key="gw" data-text></label>
       </div>
       <p class="muted" id="netinfo"></p>
       <div class="row" style="margin-top:10px">
@@ -129,6 +134,8 @@ details summary { cursor: pointer; font-weight: 600; }
     </details>
   </section>
 </main>
+<footer class="muted">racetimer is free software (GPL-3.0):
+  <a href="https://github.com/geekhostuk/racetimer">source code</a></footer>
 <script>
 "use strict";
 const SPAN_MS = 10000;          // strip chart width
@@ -241,6 +248,7 @@ const NET_WHY = { 201: "network not found (the gate only sees 2.4 GHz networks)"
   15: "wrong password?", 202: "wrong password?", 204: "wrong password?", 205: "connection failed" };
 
 function onNet(m) {
+  if (m.if === "eth") return onEthernet(m);
   const el = $("net"), info = $("netinfo");
   el.hidden = m.st === "off";
   if (m.st === "off") { info.textContent = "Access point only."; return; }
@@ -254,6 +262,24 @@ function onNet(m) {
     el.className = "chip " + (m.st === "retry" ? "bad" : ""); el.textContent = `Wi-Fi: ${m.st === "retry" ? "not connected" : "connecting…"}`;
     info.textContent = `${m.st === "retry" ? "Not connected" : "Connecting"} to ${m.ssid}` + (why ? `: ${why}. Retrying.` : "…");
   }
+}
+
+// The Teensy controller: Ethernet, its address from DHCP or fixed (sip,
+// sgw: the settings), and its name on the network.
+function onEthernet(m) {
+  document.querySelectorAll("[data-net]").forEach((el) => { el.hidden = el.dataset.net !== "eth"; });
+  for (const [key, v] of [["ip", m.sip], ["gw", m.sgw]]) {
+    const el = document.querySelector(`[data-key="${key}"]`);
+    if (document.activeElement !== el) el.value = v;
+  }
+  const el = $("net"), info = $("netinfo"), want = m.sip.split("/")[0];
+  const link = (host) => { const a = document.createElement("a"); a.href = a.textContent = `http://${host}/`; return a; };
+  el.hidden = false;
+  el.className = "chip " + (m.st === "up" ? "ok" : "bad");
+  el.textContent = m.st === "up" ? `Ethernet: ${m.ip}` : "Ethernet: no address";
+  if (want && want !== m.ip) info.replaceChildren("Moving to a fixed address: open ", link(want), " and Save there. Unsaved, a power cycle brings back the old one.");
+  else if (!want && !m.dhcp) info.replaceChildren("Moving to DHCP: find the gate at ", link(`${m.name}.local`), " or in the router's list, and Save there.");
+  else info.replaceChildren(`Ethernet, ${m.dhcp ? "address from DHCP" : "fixed address"}, ${m.mbps} Mbit/s. Also at `, link(`${m.name}.local`), ".");
 }
 
 function onStatus(m) {
