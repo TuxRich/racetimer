@@ -46,8 +46,13 @@ Per gate:
   live web UI from its own Wi-Fi access point.
 - **Or a Teensy 4.1 with Ethernet** (`gate-teensy/`): the same gate logic
   and web UI, compiled from `gate/src`, on a wired network instead of the
-  gate's own Wi-Fi. Not yet run on hardware: see
-  [docs/teensy.md](docs/teensy.md).
+  gate's own Wi-Fi. Runs on a Teensy 4.1 on Ethernet; not yet tried with
+  the receivers: see [docs/teensy.md](docs/teensy.md).
+- **Race software** (FPVTrackside, as its own new timer) can use a gate as
+  its lap timer through the **timer API**, a WebSocket at `/api`: it sets
+  the channels, starts and stops races, and gets every pass with its
+  verdict. Spec: [docs/timer-api.md](docs/timer-api.md). On the Teensy
+  controller and the simulator so far.
 
 ## Quick start
 
@@ -91,14 +96,15 @@ console to the receivers, and **Record**, which saves the session as CSV for
 
 | | |
 |---|---|
-| `uv run tools/gate_sim.py` | A pretend gate: open http://localhost:8058/ to try the web UI with no hardware. |
+| `uv run tools/gate_sim.py` | A pretend gate: open http://localhost:8058/ to try the web UI with no hardware. Speaks the timer API too (`ws://localhost:8058/api`). |
+| `uv run tools/timer_api.py ws://racegate-XXXX.local/api` | Run a race through the timer API, as race software would, and print each detection and lap. The example to follow when writing a client. |
 | `uv run tools/c5_frames.py /dev/ttyUSB0` | Check one receiver's UART link through a USB-UART adapter (2 Mbaud): updates per second per channel, levels, CRC errors. |
 | `uv run tools/plot_log.py gate-….csv` | Plot a recording: levels with pass markers, and top − bottom per verdict, to set the Δ limit. |
 
 ## Tests
 
 ```sh
-cd gate && pio test -e native       # pairing, verdicts, laps, calibration
+cd gate && pio test -e native       # pairing, verdicts, laps, calibration, timer API
 cd ../gate-teensy && pio test -e native   # receiver frame parser, WebSocket
 ```
 

@@ -1,13 +1,13 @@
 """Embed the web page, gzipped, in the firmware. A PlatformIO pre-build
 script: gate/web/index.html (the page the WROOM serves too) becomes
-$BUILD_DIR/page/index_html.h. GPL-3.0-or-later."""
+$BUILD_DIR/generated/index_html.h. GPL-3.0-or-later."""
 import gzip
 import pathlib
 
 Import("env")  # noqa: F821 (SCons)
 
 page = pathlib.Path(env.subst("$PROJECT_DIR")).parent / "gate" / "web" / "index.html"  # noqa: F821
-out = pathlib.Path(env.subst("$BUILD_DIR")) / "page" / "index_html.h"  # noqa: F821
+out = pathlib.Path(env.subst("$BUILD_DIR")) / "generated" / "index_html.h"  # noqa: F821
 data = gzip.compress(page.read_bytes(), compresslevel=9, mtime=0)
 rows = ",\n".join("    " + ", ".join(f"0x{b:02x}" for b in data[i : i + 16]) for i in range(0, len(data), 16))
 text = (

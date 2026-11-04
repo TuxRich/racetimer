@@ -68,6 +68,7 @@ details summary { cursor: pointer; font-weight: 600; }
   <span id="b0" class="chip">top: —</span>
   <span id="b1" class="chip">bottom: —</span>
   <span id="cal" class="chip" hidden>calibrating…</span>
+  <span id="race" class="chip ok" hidden title="A race started by race software (the timer API)"></span>
   <span id="net" class="chip" hidden></span>
   <div class="legend"><span><i style="background:var(--top)"></i>top</span>
     <span><i style="background:var(--bot)"></i>bottom</span></div>
@@ -291,6 +292,8 @@ function onStatus(m) {
     el.title = `setups ${b.setups}, bad frames ${b.bad}, link fill ${b.fill}‰, running ${b.run}`;
   });
   $("cal").hidden = !m.cal;
+  $("race").hidden = !m.race;
+  $("race").textContent = `race ${m.race}`;
 }
 
 function draw() {

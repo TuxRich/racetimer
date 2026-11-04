@@ -1,6 +1,7 @@
 /* GPL-3.0-or-later. */
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -19,6 +20,7 @@ typedef struct {
     uint8_t laps[GATE_MAX_CH];      /* seat lap count already reported */
     uint32_t last_t_ms[GATE_MAX_CH]; /* board time of the seat's previous update */
     uint8_t level_max[GATE_MAX_CH]; /* for the UI, since its last read */
+    uint8_t last_max[GATE_MAX_CH];  /* what that read got (gate_levels_now) */
     /* Clock offset (gate us - board us): min over this bucket and the last */
     bool have_offset;
     int64_t offset_us, bucket_min, prev_min, bucket_start;
@@ -26,19 +28,37 @@ typedef struct {
     uint32_t saturated, telemetry_drops, link_fill_pm;
     bool running;
     uint32_t levels_at_status;
+    float fps; /* LEVELS frames a second, over the last status period */
 } board_state_t;
 
 static SemaphoreHandle_t lock;
 static board_state_t boards[C5_BOARDS];
 static fusion_t fusion;
 static char names[GATE_MAX_CH][8];
+static uint16_t mhz[GATE_MAX_CH];
 static unsigned nch;
+/* The race (timer API): every verdict from its start, numbered from 0. */
+static struct {
+    uint32_t no; /* races so far: the current or last one's number */
+    bool running;
+    int64_t start_ms;
+    uint32_t count; /* detections so far: the next one's number */
+    gate_detection_t kept[GATE_RACE_KEPT]; /* detection n at n % GATE_RACE_KEPT */
+} race;
 static char events[EVENTS][EVENT_BYTES];
 static unsigned ev_head, ev_n;
 static int64_t status_at_us;
 static bool cal_finished; /* a calibration's last pair came in: save its offset */
 
 uint32_t gate_now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+int64_t gate_now_us(void) { return esp_timer_get_time(); }
+
+/* A recent time on the 32-bit ms clock (wraps every 49 days) in ms since boot. */
+static int64_t ms_since_boot(uint32_t t_ms) {
+    int64_t now = esp_timer_get_time() / 1000;
+    return now - (uint32_t)((uint32_t)now - t_ms);
+}
 
 static void event_push(const char *json) {
     if (ev_n == EVENTS) {
@@ -49,7 +69,7 @@ static void event_push(const char *json) {
     ev_n++;
 }
 
-/* Channel names from the CHANNELS arguments ("R1=5658 R3=5732 ..."). */
+/* Channel names and MHz from the CHANNELS arguments ("R1=5658 R3=5732 ..."). */
 static void parse_names(const char *channels) {
     nch = 0;
     const char *p = channels;
@@ -62,6 +82,7 @@ static void parse_names(const char *channels) {
         if (len >= sizeof(names[0])) len = sizeof(names[0]) - 1;
         memcpy(names[nch], p, len);
         names[nch][len] = 0;
+        mhz[nch] = eq && eq < end ? (uint16_t)strtoul(eq + 1, NULL, 10) : 0;
         nch++;
         p = end;
     }
@@ -136,6 +157,19 @@ static void clock_update(board_state_t *bs, uint32_t t_ms, int64_t rx_us) {
 
 static const char *const VERDICT[] = {"VALID", "OVER", "UNDER", "SINGLE_TOP", "SINGLE_BOTTOM"};
 
+/* In a race, a verdict is a detection. */
+static void race_keep(const fusion_event_t *e) {
+    gate_detection_t *d = &race.kept[race.count++ % GATE_RACE_KEPT];
+    *d = (gate_detection_t){.t_ms = ms_since_boot(e->t_ms),
+                            .mhz = e->ch < nch ? mhz[e->ch] : 0,
+                            .delta = e->delta,
+                            .ch = e->ch,
+                            .verdict = e->verdict,
+                            .counted = e->counted,
+                            .peak = {e->peak[FUSION_TOP], e->peak[FUSION_BOTTOM]}};
+    if (e->ch < nch) snprintf(d->name, sizeof(d->name), "%s", names[e->ch]);
+}
+
 static void drain_fusion(void) {
     fusion_event_t e;
     char json[256];
@@ -146,6 +180,7 @@ static void drain_fusion(void) {
                  e.t_ms, e.ch, VERDICT[e.verdict], e.counted, e.calibration, e.peak[FUSION_TOP],
                  e.peak[FUSION_BOTTOM], e.delta, e.lap_ms);
         event_push(json);
+        if (race.running) race_keep(&e);
     }
 }
 
@@ -230,6 +265,7 @@ size_t gate_json_levels(char *buf, size_t cap) {
         n += (size_t)snprintf(buf + n, cap - n, "%s[", b ? "," : "");
         for (unsigned ch = 0; ch < nch && n < cap; ch++) {
             n += (size_t)snprintf(buf + n, cap - n, "%s%u", ch ? "," : "", boards[b].level_max[ch]);
+            boards[b].last_max[ch] = boards[b].level_max[ch];
             boards[b].level_max[ch] = 0;
         }
         if (n < cap) n += (size_t)snprintf(buf + n, cap - n, "]");
@@ -263,14 +299,15 @@ size_t gate_json_status(char *buf, size_t cap) {
     xSemaphoreTake(lock, portMAX_DELAY);
     float secs = status_at_us ? (now - status_at_us) / 1e6f : 1;
     status_at_us = now;
-    size_t n = (size_t)snprintf(buf, cap, "{\"t\":\"st\",\"up\":%" PRId64 ",\"cal\":%d,\"b\":[", now / 1000000,
-                                fusion_calibrating(&fusion));
+    size_t n = (size_t)snprintf(buf, cap, "{\"t\":\"st\",\"up\":%" PRId64 ",\"cal\":%d,\"race\":%" PRIu32 ",\"b\":[",
+                                now / 1000000, fusion_calibrating(&fusion), race.running ? race.no : 0);
     for (unsigned b = 0; b < C5_BOARDS && n < cap; b++) {
         c5_stats_t st;
         c5_link_stats(b, &st);
         board_state_t *bs = &boards[b];
         float fps = (st.levels - bs->levels_at_status) / secs;
         bs->levels_at_status = st.levels;
+        bs->fps = fps;
         n += (size_t)snprintf(buf + n, cap - n,
                               "%s{\"ok\":%d,\"fps\":%.0f,\"crc\":%" PRIu32 ",\"bad\":%" PRIu32 ",\"setups\":%" PRIu32
                               ",\"drops\":%" PRIu32 ",\"fill\":%" PRIu32 ",\"sat\":%" PRIu32 ",\"run\":%d}",
@@ -298,4 +335,77 @@ size_t gate_json_config(char *buf, size_t cap) {
                               s.channels, s.gain, s.enter_at, s.exit_at, s.delta_max, s.offset, s.pair_window_ms,
                               s.pair_wait_ms, s.min_lap_ms, s.sta_ssid);
     return n < cap ? n : 0;
+}
+
+void gate_race_start(int64_t start_ms) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    fusion_clear(&fusion); /* laps count from the start; a pass under way is not this race's */
+    race.no++;
+    race.running = true;
+    race.start_ms = start_ms;
+    race.count = 0;
+    xSemaphoreGive(lock);
+}
+
+void gate_race_stop(void) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    race.running = false;
+    xSemaphoreGive(lock);
+}
+
+bool gate_race(gate_race_t *out) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    *out = (gate_race_t){.no = race.no, .running = race.running, .start_ms = race.start_ms, .count = race.count};
+    xSemaphoreGive(lock);
+    return out->running;
+}
+
+bool gate_race_detection(uint32_t seq, gate_detection_t *out) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    bool kept = seq < race.count && race.count - seq <= GATE_RACE_KEPT;
+    if (kept) *out = race.kept[seq % GATE_RACE_KEPT];
+    xSemaphoreGive(lock);
+    return kept;
+}
+
+unsigned gate_channels(char name[GATE_MAX_CH][8], uint16_t mhz_out[GATE_MAX_CH]) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    unsigned n = nch;
+    memcpy(name, names, sizeof(names));
+    memcpy(mhz_out, mhz, sizeof(mhz));
+    xSemaphoreGive(lock);
+    return n;
+}
+
+unsigned gate_levels_now(uint8_t level[C5_BOARDS][GATE_MAX_CH], bool crossing[GATE_MAX_CH]) {
+    xSemaphoreTake(lock, portMAX_DELAY);
+    unsigned n = nch;
+    for (unsigned ch = 0; ch < n; ch++) {
+        crossing[ch] = false;
+        for (unsigned b = 0; b < C5_BOARDS; b++) {
+            level[b][ch] = boards[b].last_max[ch];
+            crossing[ch] |= boards[b].seat[ch].crossing;
+        }
+    }
+    xSemaphoreGive(lock);
+    return n;
+}
+
+void gate_board(unsigned board, gate_board_t *out) {
+    *out = (gate_board_t){0};
+    if (board >= C5_BOARDS) return;
+    c5_stats_t st;
+    c5_link_stats(board, &st);
+    int64_t now = esp_timer_get_time();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    const board_state_t *bs = &boards[board];
+    *out = (gate_board_t){.ok = st.last_levels_us && now - st.last_levels_us < 1000000,
+                          .scanning = bs->running,
+                          .hops_per_s = bs->fps,
+                          .crc_errors = st.crc_errors,
+                          .bad_frames = st.bad_frames,
+                          .setups = st.setups,
+                          .drops = bs->telemetry_drops,
+                          .clipped = bs->saturated};
+    xSemaphoreGive(lock);
 }

@@ -21,6 +21,7 @@ extern "C" {
 #include "c5_frame.h"
 #include "c5_link.h"
 #include "gate.h"
+#include "gate_api.h"
 #include "gate_fusion.h"
 #include "settings.h"
 
@@ -41,6 +42,8 @@ bool net_set(const char *key, const char *value);
 bool net_save(void);
 /* The page's "net" message: link, address, name, settings. */
 size_t net_json(char *buf, size_t cap);
+/* The gate's name on the network, racegate-XXXX. */
+const char *net_name(void);
 /* One line on the console: the gate's name, address and link. */
 void net_print(void);
 

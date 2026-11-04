@@ -150,3 +150,21 @@ between gates, RotorHazard plugin.
   yet on hardware. Found there: a finished calibration's offset was never
   saved or shown, and the next settings change undid it (`gate.c`, fixed for
   both controllers).
+- 2026-11-02: the timer API (docs/timer-api.md), for race software to use a
+  gate as its lap timer, first as a new FPVTrackside timer: a WebSocket at
+  `/api` (`gate/src/gate_api.c`; races, detections with verdicts and replay,
+  clock sync, levels, status). On the Teensy controller and in
+  `tools/gate_sim.py`; `tools/timer_api.py` is a client to follow. Host tests
+  pass (11); ran against the Teensy firmware on a PC and the simulator. The
+  WROOM's web server doesn't serve it yet; the FPVTrackside timer is to be
+  written.
+- 2026-11-04: `gate-teensy/` on a Teensy 4.1 with Ethernet, receivers not
+  yet connected: DHCP and `racegate-XXXX.local`, the page and its
+  WebSocket, the USB console and the timer API (a race, levels, replay) all
+  work. Found there: the stall check's timestamp could be a millisecond in
+  the future, so a client with a full send buffer was dropped at once and
+  most page loads were cut off (`web.cpp`, fixed; the stall limit is now
+  5 s); and QNEthernet 0.37.0's Teensy driver could hang the loop for
+  seconds, and USB with it, depending on where the code landed in memory
+  (patched at build time, `patch_qnethernet.py`; held across five layouts,
+  including one that hung on every boot without it).

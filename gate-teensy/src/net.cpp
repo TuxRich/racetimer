@@ -133,6 +133,8 @@ bool net_set(const char *key, const char *value) {
     return true;
 }
 
+const char *net_name(void) { return name; }
+
 bool net_save(void) {
     blob_t b = {VERSION, cur};
     nvs_handle_t h;

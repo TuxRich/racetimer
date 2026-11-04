@@ -7,9 +7,10 @@ calibration and settings, and Widscan58's pass detection, are compiled as
 they are. What changes is the network: wired Ethernet instead of the gate's
 own Wi-Fi access point. The firmware is in `gate-teensy/`.
 
-> **Status:** builds, its host tests pass, and the firmware has run on a
-> PC against two simulated receivers (real frames at ~1900 updates/s) and
-> a browser. It has not run on a Teensy yet.
+> **Status:** runs on a Teensy 4.1 on Ethernet: the page, the USB console
+> and the timer API work (2026-11-04). The receivers haven't been connected
+> to it yet; on a PC, the firmware has run against two simulated receivers
+> (real frames at ~1900 updates/s).
 
 |  | ESP32-WROOM (`gate/`) | Teensy 4.1 (`gate-teensy/`) |
 |---|---|---|
@@ -132,8 +133,11 @@ cd gate-teensy
 pio run -t upload
 ```
 
-The first upload may need a press of the Teensy's button. The host tests
-(WebSocket handshake and framing, the receiver frame parser):
+This uses the Teensy Loader (a small window opens), which does the erase a
+Teensy 4.1 needs; PJRC's command-line loader gave up partway through here.
+The first upload may need a press of the Teensy's button, and so does one
+after the board has stopped answering on USB. The host tests (WebSocket
+handshake and framing, the receiver frame parser):
 
 ```bash
 cd gate-teensy
@@ -154,8 +158,19 @@ pretends to be a Teensy controller.
   reply lines and CRC-checked frames.
 - `net.cpp`: Ethernet (QNEthernet), DHCP or a fixed address, the name and
   mDNS. `web.cpp` and `ws.c`: a small HTTP and WebSocket server for the
-  page, and the commands, also from USB serial.
+  page, and the commands, also from USB serial; and the timer API for race
+  software (FPVTrackside) at `/api`, `gate/src/gate_api.c`
+  ([timer-api.md](timer-api.md)).
 - The page is `gate/web/index.html`, gzipped into the firmware at build
   time (`embed_page.py`).
+- `patch_qnethernet.py` edits QNEthernet 0.37.0's Teensy driver before it
+  is compiled. Unpatched, the driver could hang the loop for seconds at a
+  time, and USB with it (pings mostly lost, the page stuck), on some builds
+  and not others: it waits for a free transmit descriptor in a tight loop
+  with no limit, and rings the MAC's doorbells without a memory barrier.
+  The patch adds the barriers, makes that wait ring the doorbell again and
+  pause between looks, and rings both doorbells from the driver's poll.
+  Moving to another QNEthernet version means checking these again (the
+  script stops the build if the driver isn't the one it was written for).
 - Saving settings writes flash with interrupts off, so each receiver loses
   a frame or two (its `crc` count goes up by a few). Harmless.

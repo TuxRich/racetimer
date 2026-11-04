@@ -6,11 +6,14 @@
  * Ethernet address, and the "net" message carries it (net.cpp).
  *
  * One small HTTP server on port 80: GET / sends the page (gate/web's
- * index.html, gzipped by embed_page.py), GET /ws upgrades to the
- * WebSocket. Nothing waits: the page goes out as fast as its connection
- * takes it, a message that doesn't fit a client's send buffer is dropped
- * for that client, and a client that has taken nothing for a second is
- * closed, as a stalled client is on the WROOM. */
+ * index.html, gzipped by embed_page.py), GET /ws upgrades to the page's
+ * WebSocket, GET /api to the timer API's (gate/src/gate_api.h,
+ * docs/timer-api.md). Nothing waits: the page goes out as fast as its
+ * connection takes it, a page message that doesn't fit a client's send
+ * buffer is dropped for that client (timer API messages wait their turn),
+ * and a client with no room for 5 s is closed: gone or not reading. (The
+ * WROOM gives it a second; TCP takes longer than that to resend a lost
+ * packet, which Wi-Fi clients see now and then.) */
 #include <Arduino.h>
 #include <QNEthernet.h>
 #include <stdarg.h>
@@ -20,6 +23,7 @@
 #include <strings.h>
 #include "index_html.h"
 #include "teensy_gate.h"
+#include "version.h"
 #include "ws.h"
 
 using namespace qindesign::network;
@@ -29,10 +33,11 @@ using namespace qindesign::network;
 #define MAX_CLIENTS 6      /* page loads and WebSockets at once; lwIP has 8 TCP connections */
 #define REQUEST_BYTES 1536 /* request line and headers */
 #define REQUEST_MS 5000    /* to send them */
-#define SEND_MS 1000       /* a client that takes nothing for this long is closed */
-#define IN_BYTES 1024      /* frames from the page */
-#define COMMAND_BYTES 256  /* the longest command, as on the WROOM */
-#define MESSAGE_BYTES 768  /* the longest message to the page */
+#define SEND_MS 5000       /* a client with no room for what it is due this long is closed */
+#define IN_BYTES 1024      /* frames from a client */
+#define COMMAND_BYTES 256  /* the page's longest command, as on the WROOM */
+#define MESSAGE_BYTES 768  /* the longest message to a client */
+#define API_BURST 32       /* timer API messages per client per UI tick, at most */
 
 static const char *const BOARD[] = {"top", "bottom", "gate"};
 
@@ -41,13 +46,17 @@ typedef enum { C_FREE, C_REQUEST, C_RESPONSE, C_WS } client_state_t;
 typedef struct {
     EthernetClient conn;
     client_state_t state;
-    uint32_t since_ms; /* C_REQUEST: when it connected; after: the last write that went in */
+    uint32_t since_ms;   /* C_REQUEST: when it connected */
+    bool full;           /* a send found no room, and nothing has gone in since */
+    uint32_t full_ms;    /* when it found none */
     char req[REQUEST_BYTES];
     size_t req_len;
     const uint8_t *body; /* C_RESPONSE: what is still to go */
     size_t body_len;
-    uint8_t in[IN_BYTES]; /* C_WS: frames from the page */
+    uint8_t in[IN_BYTES]; /* C_WS: frames from the client */
     size_t in_len;
+    bool api;             /* C_WS: the timer API (/api), not the page (/ws) */
+    gate_api_client_t api_client;
 } client_t;
 
 static EthernetServer server(80);
@@ -81,34 +90,45 @@ static void close_client(client_t *c, bool graceful) {
     c->state = C_FREE;
 }
 
+static void blocked(client_t *c, bool sent) {
+    if (sent) {
+        c->full = false;
+    } else if (!c->full) {
+        c->full = true;
+        c->full_ms = millis();
+    }
+}
+
+/* Something to send, and no room for it this long: gone or not reading. */
+static bool stalled(const client_t *c) { return c->full && millis() - c->full_ms > SEND_MS; }
+
 /* All of it or nothing: part of a WebSocket frame would garble the stream,
  * so what doesn't fit the send buffer is dropped for this client. lwIP
  * takes a write whole or not at all (none: out of TCP segments, as good as
  * no room). */
 static bool put(client_t *c, const uint8_t *data, size_t len) {
-    if (c->conn.availableForWrite() < (int)len) return false;
-    size_t n = c->conn.write(data, len);
-    if (!n) return false;
-    if (n != len) {
+    size_t n = c->conn.availableForWrite() >= (int)len ? c->conn.write(data, len) : 0;
+    if (n && n != len) {
         close_client(c, false);
         return false;
     }
-    c->since_ms = millis();
-    return true;
+    blocked(c, n);
+    return n;
 }
 
-static void ws_send(client_t *c, uint8_t opcode, const void *payload, size_t len) {
+static bool ws_send(client_t *c, uint8_t opcode, const void *payload, size_t len) {
     uint8_t frame[WS_HEADER_MAX + MESSAGE_BYTES];
-    if (len > MESSAGE_BYTES) return;
+    if (len > MESSAGE_BYTES) return false;
     size_t h = ws_header(frame, opcode, len);
     memcpy(frame + h, payload, len);
-    put(c, frame, h + len);
+    return put(c, frame, h + len);
 }
 
+/* To every page. */
 static void broadcast(const char *text, size_t len) {
     if (!len) return;
     for (client_t &c : clients)
-        if (c.state == C_WS) ws_send(&c, WS_TEXT, text, len);
+        if (c.state == C_WS && !c.api) ws_send(&c, WS_TEXT, text, len);
 }
 
 /* to: one client, or NULL for all. */
@@ -217,8 +237,9 @@ static const char *header(const char *req, const char *name, size_t *len) {
     return NULL;
 }
 
-/* The WebSocket handshake, then the settings and network for the page. */
-static void upgrade(client_t *c) {
+/* The WebSocket handshake, then for the page its settings and network, for
+ * a timer API client the hello. */
+static void upgrade(client_t *c, bool api) {
     size_t key_len = 0, up_len = 0;
     const char *key = header(c->req, "Sec-WebSocket-Key", &key_len);
     const char *up = header(c->req, "Upgrade", &up_len);
@@ -233,14 +254,21 @@ static void upgrade(client_t *c) {
                      "Sec-WebSocket-Accept: %s\r\n\r\n",
                      accept);
     c->state = C_WS;
+    c->api = api;
     c->in_len = 0;
-    c->conn.setNoDelay(true); /* the levels go out as they are written, not Nagle-delayed */
+    c->conn.setNoDelay(true); /* messages go out as they are written, not Nagle-delayed */
     if (!put(c, (const uint8_t *)head, (size_t)n)) {
         close_client(c, false);
         return;
     }
-    send_config(c);
-    send_net(c);
+    if (api) {
+        char buf[MESSAGE_BYTES];
+        size_t len = gate_api_hello(&c->api_client, buf, sizeof(buf));
+        if (len) ws_send(c, WS_TEXT, buf, len);
+    } else {
+        send_config(c);
+        send_net(c);
+    }
 }
 
 static void request(client_t *c) {
@@ -256,8 +284,8 @@ static void request(client_t *c) {
     else if (!strcmp(path, "/") || !strcmp(path, "/index.html"))
         respond(c, "200 OK", "Content-Type: text/html\r\nContent-Encoding: gzip\r\nCache-Control: no-cache\r\n",
                 index_html_gz, sizeof(index_html_gz));
-    else if (!strcmp(path, "/ws"))
-        upgrade(c);
+    else if (!strcmp(path, "/ws") || !strcmp(path, "/api"))
+        upgrade(c, path[1] == 'a');
     else
         respond(c, "404 Not Found", "", NULL, 0);
 }
@@ -280,23 +308,31 @@ static void poll_request(client_t *c) {
 }
 
 static void poll_response(client_t *c) {
-    int room = c->conn.availableForWrite();
-    if (room > 0 && c->body_len) {
-        size_t n = c->conn.write(c->body, (size_t)room < c->body_len ? (size_t)room : c->body_len);
+    if (c->body_len) {
+        int room = c->conn.availableForWrite();
+        size_t n = room > 0 ? c->conn.write(c->body, (size_t)room < c->body_len ? (size_t)room : c->body_len) : 0;
         c->body += n;
         c->body_len -= n;
-        if (n) c->since_ms = millis();
+        blocked(c, n);
     }
     if (!c->body_len) close_client(c, true);
-    else if (!c->conn.connected() || millis() - c->since_ms > SEND_MS) close_client(c, false);
+    else if (!c->conn.connected() || stalled(c)) close_client(c, false);
+}
+
+/* A request to the timer API, and its reply. */
+static void api_request(client_t *c, const char *json) {
+    char reply[MESSAGE_BYTES];
+    size_t n = gate_api_request(&c->api_client, json, reply, sizeof(reply));
+    if (n) ws_send(c, WS_TEXT, reply, n);
 }
 
 static void ws_frame(client_t *c, const ws_frame_t *f) {
-    if (f->opcode == WS_TEXT && f->fin && f->len && f->len < COMMAND_BYTES) {
-        char line[COMMAND_BYTES];
-        memcpy(line, f->payload, f->len);
-        line[f->len] = 0;
-        command(line);
+    if (f->opcode == WS_TEXT && f->fin && f->len && (c->api || f->len < COMMAND_BYTES)) {
+        char text[IN_BYTES];
+        memcpy(text, f->payload, f->len);
+        text[f->len] = 0;
+        if (c->api) api_request(c, text);
+        else command(text);
     } else if (f->opcode == WS_PING) {
         ws_send(c, WS_PONG, f->payload, f->len);
     } else if (f->opcode == WS_CLOSE) {
@@ -320,7 +356,22 @@ static void poll_ws(client_t *c) {
         c->in_len -= (size_t)used;
         memmove(c->in, c->in + used, c->in_len);
     }
-    if (c->state == C_WS && (!c->conn.connected() || millis() - c->since_ms > SEND_MS)) close_client(c, false);
+    if (c->state == C_WS && (!c->conn.connected() || stalled(c))) close_client(c, false);
+}
+
+/* A timer API client's messages that are due: detections, levels, status,
+ * as many as its connection takes now. */
+static void api_poll(client_t *c, uint32_t now) {
+    char buf[MESSAGE_BYTES];
+    for (int i = 0; i < API_BURST && c->state == C_WS; i++) {
+        gate_api_client_t before = c->api_client;
+        size_t n = gate_api_next(&c->api_client, now, buf, sizeof(buf));
+        if (!n) break;
+        if (!ws_send(c, WS_TEXT, buf, n)) {
+            c->api_client = before; /* again next tick */
+            break;
+        }
+    }
 }
 
 static void accept_client(void) {
@@ -331,8 +382,10 @@ static void accept_client(void) {
             c.conn = conn;
             c.state = C_REQUEST;
             c.since_ms = millis();
+            c.full = false;
             c.req_len = 0;
             c.req[0] = 0;
+            c.api = false;
             return;
         }
     conn.abort(); /* all taken */
@@ -358,7 +411,8 @@ static void console_event(const char *json) {
 
 /* What the WROOM's UI task does: levels ~30 times a second, events as they
  * come, status, config and network once a second. Runs with no page open
- * too: it also reports singles and saves a finished calibration. */
+ * too: it also reports singles and saves a finished calibration. Then the
+ * timer API clients' messages. */
 static void ui_poll(void) {
     static uint32_t levels_ms, status_ms;
     static char buf[MESSAGE_BYTES];
@@ -377,6 +431,8 @@ static void ui_poll(void) {
         send_config(NULL); /* a calibration changes the offset */
         send_net(NULL);
     }
+    for (client_t &c : clients)
+        if (c.state == C_WS && c.api) api_poll(&c, now);
     for (client_t &c : clients)
         if (c.state == C_WS) c.conn.flush();
 }
@@ -413,7 +469,10 @@ static void console_poll(void) {
     }
 }
 
-void web_start(void) { server.begin(); }
+void web_start(void) {
+    gate_api_init(net_name(), "teensy41", GATE_VERSION);
+    server.begin();
+}
 
 void web_poll(void) {
     accept_client();
